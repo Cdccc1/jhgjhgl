@@ -1,0 +1,20 @@
+===== Fit summary =====
+DATA_DIR: D:\Google download\data
+Rows used: 1716
+fcpu_max_ghz: 2.0352
+fgpu_max_ghz: 1.3005
+
+beta_cpu,beta_gpu,beta0:
+1.4857453365452211,0.16131646597102467,10.992355851720605
+
+Restored D_min and alphas:
+D_min=12.639417654236851
+alpha_cpu=0.11754855937110247
+alpha_gpu=0.012762966647988714
+alpha_ddr=0.8696884739809088
+
+Metrics:
+MRE=0.25105197416295116
+MAE=5.760412362535284
+RMSE=9.424117385643317
+R2=0.002133015980097519
