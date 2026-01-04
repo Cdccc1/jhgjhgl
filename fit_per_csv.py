@@ -7,17 +7,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
-
 DATA_DIR = r"D:\Google download\data"
-TARGET_COL = "total_time"
-
-
-# 你可以在这里补充更多“可能出现的列名”
-ALIASES = {
-    "fcpu": {"fcpu", "f_cpu", "cpu_freq", "cpu_frequency", "cpu_khz", "cpu"},
-    "fgpu": {"fgpu", "f_gpu", "gpu_freq", "gpu_frequency", "gpu_hz", "gpu"},
-    "total_time": {"total_time", "total", "frame_time", "t_total", "totaltime"},
-}
+TARGET_COL = "fps"  # 修改：目标是帧率，我们拟合帧率的倒数
 
 
 def safe_name(fname: str) -> str:
@@ -29,7 +20,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     new_cols = []
     for c in df.columns:
-        c = str(c).replace("\ufeff", "")   # 去BOM
+        c = str(c).replace("\ufeff", "")  # 去BOM
         c = c.strip()
         c = c.lower()
         new_cols.append(c)
@@ -37,47 +28,25 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def rename_by_alias(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    将各种可能的列名映射为标准列名：fcpu, fgpu, total_time
-    """
-    df = df.copy()
-    colset = set(df.columns)
-
-    rename_map = {}
-    for std, candidates in ALIASES.items():
-        hit = None
-        for cand in candidates:
-            if cand in colset:
-                hit = cand
-                break
-        if hit is not None and hit != std:
-            rename_map[hit] = std
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    return df
-
-
 def read_one_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, sep=None, engine="python")
     df["__file__"] = os.path.basename(path)
     df = normalize_columns(df)
-    df = rename_by_alias(df)
     return df
 
 
-def add_freq_ghz(df: pd.DataFrame, fcpu_col="fcpu", fgpu_col="fgpu") -> pd.DataFrame:
+def add_freq_ghz(df: pd.DataFrame) -> pd.DataFrame:
     """
     统一单位到GHz：
-      fcpu: kHz -> GHz
-      fgpu: Hz  -> GHz
+      fcpu: kHz -> GHz (除以1e6)
+      fgpu: hz -> GHz (除以1e9)
+      ddr: 固定为1.6GHz
     """
     out = df.copy()
 
-    if fcpu_col not in out.columns or fgpu_col not in out.columns:
+    if "fcpu" not in out.columns or "fgpu" not in out.columns:
         raise KeyError(
-            f"Missing freq columns. Need '{fcpu_col}' and '{fgpu_col}'. "
+            f"Missing freq columns. Need 'fcpu' and 'fgpu'. "
             f"Got columns: {list(out.columns)}"
         )
     if TARGET_COL not in out.columns:
@@ -85,9 +54,13 @@ def add_freq_ghz(df: pd.DataFrame, fcpu_col="fcpu", fgpu_col="fgpu") -> pd.DataF
             f"Missing target column '{TARGET_COL}'. Got columns: {list(out.columns)}"
         )
 
-    out["fcpu_ghz"] = pd.to_numeric(out[fcpu_col], errors="coerce") / 1e6
-    out["fgpu_ghz"] = pd.to_numeric(out[fgpu_col], errors="coerce") / 1e9
-    out[TARGET_COL] = pd.to_numeric(out[TARGET_COL], errors="coerce")
+    # 转换频率单位
+    out["fcpu_ghz"] = pd.to_numeric(out["fcpu"], errors="coerce") / 1e6
+    out["fgpu_ghz"] = pd.to_numeric(out["fgpu"], errors="coerce") / 1e9
+    out["ddr_ghz"] = 1.6  # 固定DDR频率为1.6GHz
+
+    # 计算帧率的倒数（即每帧时间）
+    out["frame_time"] = 1.0 / pd.to_numeric(out[TARGET_COL], errors="coerce")
     return out
 
 
@@ -106,97 +79,96 @@ def calc_metrics(y_true, y_pred):
 
 
 def fit_one_file(df: pd.DataFrame):
-    need = ["fcpu_ghz", "fgpu_ghz", TARGET_COL]
+    need = ["fcpu_ghz", "fgpu_ghz", "ddr_ghz", "frame_time"]
     work = df[need].copy().replace([np.inf, -np.inf], np.nan).dropna()
-    work = work[(work["fcpu_ghz"] > 0) & (work["fgpu_ghz"] > 0) & (work[TARGET_COL] > 0)]
+    work = work[(work["fcpu_ghz"] > 0) & (work["fgpu_ghz"] > 0) & (work["frame_time"] > 0)]
     if len(work) < 5:
         raise ValueError(f"Too few valid rows after cleaning: {len(work)}")
 
     fcpu = work["fcpu_ghz"].to_numpy(float)
     fgpu = work["fgpu_ghz"].to_numpy(float)
-    y = work[TARGET_COL].to_numpy(float)
+    fddr = work["ddr_ghz"].to_numpy(float)  # DDR频率固定
+    y = work["frame_time"].to_numpy(float)  # 目标是帧率的倒数（每帧时间）
 
     fcpu_max = float(np.max(fcpu))
     fgpu_max = float(np.max(fgpu))
+    fddr_max = float(np.max(fddr))  # 对于固定值，最大值就是其本身
 
     x_cpu = fcpu_max / fcpu
     x_gpu = fgpu_max / fgpu
+    x_ddr = fddr_max / fddr  # 对于固定值，x_ddr也是固定值
 
-    # fgpu若不变，则x_gpu恒为1 -> GPU项与常数项不可辨识
-    gpu_identifiable = float(np.std(x_gpu)) > 1e-8
+    # 使用约束优化：alpha_cpu + alpha_gpu + alpha_ddr = 1
+    def obj(params):
+        # 参数: [alpha_cpu, alpha_gpu, D_min]
+        alpha_cpu, alpha_gpu, D_min = params
+        alpha_ddr = 1.0 - alpha_cpu - alpha_gpu  # 由约束条件确定
 
-    if not gpu_identifiable:
-        # 退化为：T = b_cpu*x_cpu + b0
-        def pred2(b):
-            b_cpu, b0 = b
-            return b_cpu * x_cpu + b0
+        # 确保所有alpha值非负
+        if alpha_cpu < 0 or alpha_gpu < 0 or alpha_ddr < 0 or D_min < 0:
+            return 1e9
 
-        def obj2(b):
-            if np.any(np.asarray(b) < 0):
-                return 1e9
-            yh = pred2(b)
-            eps = 1e-12
-            return float(np.mean(np.abs(yh - y) / np.maximum(np.abs(y), eps)))
+        # 计算预测值
+        y_pred = (
+                alpha_cpu * D_min * x_cpu +
+                alpha_gpu * D_min * x_gpu +
+                alpha_ddr * D_min * x_ddr
+        )
 
-        y_min = float(np.min(y))
-        init = np.array([y_min * 0.2, y_min * 0.8], float)
-        res = minimize(obj2, init, method="SLSQP", bounds=[(0, None), (0, None)],
-                       options={"maxiter": 6000, "ftol": 1e-12})
-        if not res.success:
-            raise RuntimeError(res.message)
-        beta_cpu = float(res.x[0])
-        beta_gpu = 0.0
-        beta0 = float(res.x[1])
-        yh = pred2(res.x)
+        # 使用相对误差作为目标函数
+        eps = 1e-12
+        rel_err = np.abs(y_pred - y) / np.maximum(np.abs(y), eps)
+        return float(np.mean(rel_err))
 
-    else:
-        # 正常：T = b_cpu*x_cpu + b_gpu*x_gpu + b0
-        def pred3(b):
-            b_cpu, b_gpu, b0 = b
-            return b_cpu * x_cpu + b_gpu * x_gpu + b0
+    # 初始参数: [alpha_cpu, alpha_gpu, D_min]
+    # 约束: alpha_cpu + alpha_gpu + alpha_ddr = 1, 且所有alpha >= 0
+    y_mean = float(np.mean(y))
+    init = np.array([0.3, 0.3, y_mean], float)
 
-        def obj3(b):
-            if np.any(np.asarray(b) < 0):
-                return 1e9
-            yh = pred3(b)
-            eps = 1e-12
-            return float(np.mean(np.abs(yh - y) / np.maximum(np.abs(y), eps)))
+    # 约束条件
+    constraints = [
+        {'type': 'ineq', 'fun': lambda x: x[0]},  # alpha_cpu >= 0
+        {'type': 'ineq', 'fun': lambda x: x[1]},  # alpha_gpu >= 0
+        {'type': 'ineq', 'fun': lambda x: 1 - x[0] - x[1]},  # alpha_ddr >= 0
+        {'type': 'ineq', 'fun': lambda x: x[2]}  # D_min >= 0
+    ]
 
-        y_min = float(np.min(y))
-        init = np.array([y_min * 0.2, y_min * 0.1, y_min * 0.7], float)
-        res = minimize(obj3, init, method="SLSQP",
-                       bounds=[(0, None), (0, None), (0, None)],
-                       options={"maxiter": 8000, "ftol": 1e-12})
-        if not res.success:
-            raise RuntimeError(res.message)
-        beta_cpu, beta_gpu, beta0 = map(float, res.x)
-        yh = pred3(res.x)
+    bounds = [(0, 1), (0, 1), (0, None)]
 
-    mre, mae, rmse, r2 = calc_metrics(y, yh)
+    res = minimize(obj, init, method="SLSQP", bounds=bounds, constraints=constraints,
+                   options={"maxiter": 8000, "ftol": 1e-12})
 
-    D_min = beta_cpu + beta_gpu + beta0
-    alpha_cpu = beta_cpu / D_min if D_min > 0 else np.nan
-    alpha_gpu = beta_gpu / D_min if D_min > 0 else np.nan
-    alpha_ddr = beta0 / D_min if D_min > 0 else np.nan
+    if not res.success:
+        raise RuntimeError(res.message)
+
+    alpha_cpu, alpha_gpu, D_min = res.x
+    alpha_ddr = 1.0 - alpha_cpu - alpha_gpu
+
+    # 计算预测值
+    y_pred = (
+            alpha_cpu * D_min * x_cpu +
+            alpha_gpu * D_min * x_gpu +
+            alpha_ddr * D_min * x_ddr
+    )
+
+    mre, mae, rmse, r2 = calc_metrics(y, y_pred)
 
     out = work.copy()
-    out["T_hat"] = yh
-    out["rel_err"] = np.abs(out["T_hat"] - out[TARGET_COL]) / np.maximum(out[TARGET_COL], 1e-12)
+    out["T_hat"] = y_pred
+    out["rel_err"] = np.abs(out["T_hat"] - out["frame_time"]) / np.maximum(out["frame_time"], 1e-12)
     out["x_cpu"] = x_cpu
     out["x_gpu"] = x_gpu
+    out["x_ddr"] = x_ddr
 
     return {
         "rows": int(len(work)),
         "fcpu_max_ghz": fcpu_max,
         "fgpu_max_ghz": fgpu_max,
-        "gpu_identifiable": bool(gpu_identifiable),
-        "beta_cpu": beta_cpu,
-        "beta_gpu": beta_gpu,
-        "beta0": beta0,
-        "D_min": D_min,
+        "fddr_max_ghz": fddr_max,
         "alpha_cpu": alpha_cpu,
         "alpha_gpu": alpha_gpu,
         "alpha_ddr": alpha_ddr,
+        "D_min": D_min,
         "MRE": mre,
         "MAE": mae,
         "RMSE": rmse,
@@ -237,14 +209,11 @@ def main():
                 "rows": r["rows"],
                 "fcpu_max_ghz": r["fcpu_max_ghz"],
                 "fgpu_max_ghz": r["fgpu_max_ghz"],
-                "gpu_identifiable": r["gpu_identifiable"],
-                "beta_cpu": r["beta_cpu"],
-                "beta_gpu": r["beta_gpu"],
-                "beta0": r["beta0"],
-                "D_min": r["D_min"],
+                "fddr_max_ghz": r["fddr_max_ghz"],
                 "alpha_cpu": r["alpha_cpu"],
                 "alpha_gpu": r["alpha_gpu"],
                 "alpha_ddr": r["alpha_ddr"],
+                "D_min": r["D_min"],
                 "MRE": r["MRE"],
                 "MAE": r["MAE"],
                 "RMSE": r["RMSE"],
@@ -269,10 +238,12 @@ def main():
     if len(ok):
         ok = ok.sort_values("MRE")
         print("\nBest 5 by MRE:")
-        print(ok[["file", "rows", "gpu_identifiable", "MRE", "MAE", "RMSE", "R2"]].head(5).to_string(index=False))
+        print(ok[["file", "rows", "MRE", "MAE", "RMSE", "R2", "alpha_cpu", "alpha_gpu", "alpha_ddr"]].head(5).to_string(
+            index=False))
 
         print("\nWorst 5 by MRE:")
-        print(ok[["file", "rows", "gpu_identifiable", "MRE", "MAE", "RMSE", "R2"]].tail(5).to_string(index=False))
+        print(ok[["file", "rows", "MRE", "MAE", "RMSE", "R2", "alpha_cpu", "alpha_gpu", "alpha_ddr"]].tail(5).to_string(
+            index=False))
 
     bad = summary[summary["error"] != ""]
     if len(bad):
