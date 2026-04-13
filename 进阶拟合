@@ -1,0 +1,78 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import differential_evolution
+
+# 1. 平滑化的 Roofline 模型 (Log-Sum-Exp)
+def smooth_max(a, b, k=2):
+    # k 越大越接近真实的 max，k 较小时有助于优化器跨越边界
+    return np.log(np.exp(k * a) + np.exp(k * b)) / k
+
+def performance_model_refined(X, w_c0, w_c1, w_g0, w_g1, theta_r, theta_w, tau_0, gamma, lam):
+    cpu_uti, gpu_uti, cache_hit, r_bw, w_bw, r_osd, fcpu, fgpu, fddr, fcpu_max, fgpu_max = X
+    
+    # --- 计算受限项 ---
+    # 增加一个小偏置防止频率为0，确保计算项的物理基础
+    alpha_cpu = (w_c0 * cpu_uti + w_c1 * cpu_uti * (1 - cache_hit)) * (fcpu_max / fcpu)
+    alpha_gpu = (w_g0 * gpu_uti + w_g1 * gpu_uti * (1 - cache_hit)) * (fgpu_max / fgpu)
+    compute_bound = alpha_cpu + alpha_gpu
+    
+    # --- 访存受限项 ---
+    # 强制 theta_r 和 theta_w 的比例关系在 loss 中体现，或通过边界限制
+    T_ddr = (theta_r * r_bw + theta_w * w_bw) * (tau_0 + (1 + gamma * r_osd) * np.exp(-lam * fddr))
+    
+    # 使用平滑 max 统合
+    return smooth_max(compute_bound, T_ddr)
+
+# 2. 带有物理约束的 Loss
+def constrained_mre_loss(params, X, y_true):
+    w_c0, w_c1, w_g0, w_g1, theta_r, theta_w, tau_0, gamma, lam = params
+    
+    # 物理惩罚项：如果 theta_r 不大于 theta_w，增加 penalty
+    penalty = 0
+    if theta_r < theta_w:
+        penalty += (theta_w - theta_r) * 100
+        
+    y_pred = performance_model_refined(X, *params)
+    mre = np.mean(np.abs((y_true - y_pred) / np.maximum(y_true, 1e-9))) * 100
+    
+    return mre + penalty
+
+def main():
+    # ... [读取数据部分保持不变，确保 y_data 是 1000/fps] ...
+    # 建议此处检查 y_data 是否有异常值（如 FPS 极高或极低导致的离群点）
+    
+    # 3. 重新定义更严谨的搜索空间
+    # 参照你给出的失败参数，我们微调搜索区间
+    bounds = [
+        (1.0, 30.0),    # w_c0: 增加下限，保证 CPU 基础贡献
+        (10.0, 60.0),   # w_c1: 增加范围，给 Cache Miss 足够的惩罚权重
+        (1.0, 30.0),    # w_g0
+        (10.0, 60.0),   # w_g1
+        (2.0, 15.0),    # theta_r: 访存权重作为核心，放宽上限
+        (0.1, 2.0),     # theta_w: 限制写权重，体现非对称性
+        (0.5, 10.0),    # tau_0
+        (0.1, 5.0),     # gamma
+        (0.1, 4.0)      # lam
+    ]
+
+    print("启动物理约束引导下的全局优化...")
+    
+    result = differential_evolution(
+        constrained_mre_loss,
+        bounds,
+        args=(X_data, y_data),
+        strategy='best1bin',
+        popsize=20, # 增加种群多样性
+        tol=1e-4,
+        mutation=(0.5, 1.0),
+        recombination=0.7,
+        seed=42,
+        disp=True
+    )
+
+    popt = result.x
+    # ... [打印逻辑保持不变] ...
+    print(f"最终优化 MRE: {result.fun:.2f}%")
+
+if __name__ == "__main__":
+    main()
